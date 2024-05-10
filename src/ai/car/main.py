@@ -147,12 +147,20 @@ class CarInfo(BaseModel):
             f.write(self.model_dump_json())
 
     @classmethod
-    def load(cls, json_str: str) -> CarInfo:
-        return cls.model_validate_json(json_str)
+    def load(cls, file: Path) -> CarInfo:
+        return cls.model_validate_json(file.read_text())
 
     @property
     def details_url(self) -> str:
         return EBAY_KLEINANZEIGE_URL + f'/{self.details_link}'
+
+    @property
+    def car_details_html_file_raw(self) -> Path:
+        return DATA_DIR / 'car_detail' / 'html' / 'raw' / (self.uid + '.html')
+
+    @property
+    def car_details_html_file_clean(self) -> Path:
+        return DATA_DIR / 'car_detail' / 'html' / 'clean' / (self.uid + '.html')
 
 
 def extract_car_info_article(soup: Any) -> CarInfo:
@@ -186,10 +194,10 @@ def load_cars() -> Iterable[CarInfo]:
     for file in CAR_INFO_DIR.glob("*"):
         if file.is_dir():
             continue
-        yield CarInfo.load(file.read_text())
+        yield CarInfo.load(file)
 
 
-async def extract_detailed_information_for_each_car():
+async def fetch_detailed_information_for_each_car():
     browser = await launch(
         executablePath="/etc/profiles/per-user/denis/bin/google-chrome-stable",
         headless=False,
@@ -200,11 +208,60 @@ async def extract_detailed_information_for_each_car():
     for car in cars:
         vu = VisitableUrl(
             url=car.details_url,
-            file=DATA_DIR / 'car_detail' / (car.uid + '.html'),
+            file=car.car_details_html_file_raw,
         )
         urls.append(vu)
 
     await visit_and_save_html(browser, urls)
+
+
+def clean_detailed_information(car: CarInfo) -> None:
+    with open(car.car_details_html_file_raw) as f:
+        soup = BeautifulSoup(f.read(), 'html.parser')
+
+    script_tags = soup.find_all('script')
+    for script_tag in script_tags:
+        script_tag.decompose()
+
+    gdpr_banner = soup.find_all("div", id="gdpr-banner-container")
+    for banner in gdpr_banner:
+        banner.decompose()
+
+    with open(car.car_details_html_file_clean, 'w') as f:
+        f.write(soup.prettify())
+
+
+def clean_detailed_information_for_each_car():
+    cars = load_cars()
+
+    for car in cars:
+        clean_detailed_information(car)
+
+
+def extract_detailed_information(car: CarInfo):
+    with open(car.car_details_html_file_clean) as f:
+        soup = BeautifulSoup(f.read(), 'html.parser')
+
+    try:
+        (details,) = soup.find_all('div', id="viewad-details")
+        details_dict = {}
+        for detail in details.select('.addetailslist--detail'):
+            key = detail.contents[0].text.strip()
+            value = detail.select_one('.addetailslist--detail--value')
+            details_dict[key] = value.text.strip()
+        print(details_dict)
+    except ZeroDivisionError:
+        raise
+    except Exception as e:
+        print("failed", e)
+
+
+def extract_detailed_information_for_each_car():
+    cars = load_cars()
+
+    for car in cars:
+        extract_detailed_information(car)
+    
 
 
 if __name__ == "__main__":
@@ -215,6 +272,19 @@ if __name__ == "__main__":
     # extract_car_infos_from_html(Path("./data/html/raw/").glob("*"))
 
     # 3. Extract information from each car
-    asyncio.get_event_loop().run_until_complete(
-        extract_detailed_information_for_each_car()
-    )
+    # asyncio.get_event_loop().run_until_complete(
+    #     fetch_detailed_information_for_each_car()
+    # )
+
+    # 4. Clean html for car details
+    # clean_detailed_information_for_each_car()
+
+    # 5. Extract deatils
+    extract_detailed_information_for_each_car()
+    #
+    # car = CarInfo.load(
+    #     Path(
+    #         "data/car_info/00984929010e083490cf0fe4ed674310388d24557096198be566a26075e962e5.json"
+    #     )
+    # )
+    # extract_detailed_information(car)
