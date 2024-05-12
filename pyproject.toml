@@ -13,6 +13,7 @@ dependencies = [
     "pyppeteer",
     "structlog",
     "beautifulsoup4",
+    "tqdm",
 ]
 
 [project.optional-dependencies]
