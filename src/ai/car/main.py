@@ -1,69 +1,69 @@
 from __future__ import annotations
 
-from tqdm import tqdm
+import asyncio
 import csv
 import hashlib
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-import asyncio
+from multiprocessing import cpu_count
+from multiprocessing import Pool
+from pathlib import Path
+from typing import Any
 
+import httpx
+import instructor
+from ai.log import configure_logging
+from ai.log import get_logger
 from bs4 import BeautifulSoup
-from typing import Any, Literal
+from openai import OpenAI
+from pydantic import BaseModel
 from pyppeteer import launch
 from pyppeteer.browser import Browser
-from pathlib import Path
-from pydantic import BaseModel
+from tqdm import tqdm
+# from tqdm.asyncio import tqdm
 
-from ai.log import configure_logging, get_logger
-
-EBAY_KLEINANZEIGE_URL = "https://www.kleinanzeigen.de/"
-DATA_DIR = Path("data")
+EBAY_KLEINANZEIGE_URL = 'https://www.kleinanzeigen.de/'
+DATA_DIR = Path('data')
 CAR_INFO_DIR = DATA_DIR / 'car_info'
-
-CAR_NAMES = [
-    'Volkswagen Caddy',
-    'Mercedes-Benz V',
-    'Ford Transit Custom',
-    'Toyota Proace Verso',
-    'Peugeot Traveller',
-    'Renault Trafic Passenger',
-    'Chrysler Pacifica',
-    'Nissan NV',
-]
-
+SEARCH_PAGES_HTML_RAW = DATA_DIR / 'search_pages' / 'raw'
 
 configure_logging()
-
 log = get_logger()
 
+httpxc = httpx.Client(follow_redirects=True)
 
-@dataclass
-class SimpleSearchPage:
-    base_url: str
-    query: str
-    code: Literal['k0']
-    page: int
+
+class CarMark(BaseModel):
+    mark: str
+    count: int
+    href: str
+
+
+class CarMarkContainer(BaseModel):
+    items: list[CarMark]
+
+
+class CarModel(BaseModel):
+    mark: str
+    model: str
+    count: int
+    href: str
 
     @property
     def url(self) -> str:
-        """
-        https://www.kleinanzeigen.de/s-seite:3/sharan-7-sitzer/k0
-        """
-        return f"{self.base_url}/s-autos/s-seite:{self.page}/{self.query}/{self.code}"
-
-    def file_prefix(self) -> str:
-        return f"{self.query}__{self.page:03d}"
+        return EBAY_KLEINANZEIGE_URL + self.href
 
 
-def iterate_search_page(base_url: str, query: str) -> Iterable[SimpleSearchPage]:
-    page = 1
-    while True:
-        yield SimpleSearchPage(base_url, query, 'k0', page)
-        page += 1
+class CarModelContainer(BaseModel):
+    car_models: list[CarModel]
+    """
+    All models should be from the same mark
+    """
+    mark: str
 
 
-@dataclass
-class CategorySearchPage:
+class CategorySearchPage(BaseModel):
     base_url: str
     before_page: str
     after_page: str
@@ -72,7 +72,7 @@ class CategorySearchPage:
     @property
     def url(self) -> str:
         if self.page < 1:
-            raise ValueError("Page cannot be less than 1")
+            raise ValueError('Page cannot be less than 1')
 
         if self.page == 1:
             return self.base_url + self.before_page + '/' + self.after_page
@@ -81,51 +81,120 @@ class CategorySearchPage:
             self.base_url
             + self.before_page
             + '/'
-            + f"seite:{self.page}"
+            + f'seite:{self.page}'
             + '/'
             + self.after_page
         )
 
     def file_prefix(self) -> str:
-        return f"{self.before_page}__{self.after_page}__{self.page:03d}"
-
-
-SearchPage = SimpleSearchPage | CategorySearchPage
-
-
-def iterate_category_search_page(
-    base_url: str, before_page: str, after_page: str
-) -> Iterable[CategorySearchPage]:
-    page = 1
-    while True:
-        yield CategorySearchPage(
-            base_url,
-            before_page,
-            after_page,
-            page,
+        return (
+            f'{self.before_page.replace('/', '__')}__{self.after_page}__{self.page:03d}'
         )
-        page += 1
+
+    @classmethod
+    def from_car_model(cls, car_model: CarModel) -> CategorySearchPage:
+        split = car_model.href.split('/')
+
+        return CategorySearchPage(
+            base_url=EBAY_KLEINANZEIGE_URL,
+            before_page='/'.join(split[:-1]),
+            after_page=split[-1],
+            page=1,
+        )
 
 
-async def fetch_search_pages(pages: Iterable[SearchPage]) -> None:
-    browser = await launch(
-        executablePath="/etc/profiles/per-user/denis/bin/google-chrome-stable",
-        headless=False,
+SearchPage = CategorySearchPage
+
+
+def fetch_car_marks_from_menu():
+    client = instructor.from_openai(OpenAI())
+    resp = httpxc.get('https://www.kleinanzeigen.de/s-autos/c216+autos.typ_s:bus')
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, 'html.parser')
+
+    for section in soup.select('section.browsebox-attribute'):
+        h2 = section.select_one('h2')
+        assert h2
+        if 'Marke' in h2.text:
+            break
+    else:
+        raise ValueError('Marke subsection not found')
+
+    prompt = f"""
+    Extract all the car marks from the html:
+
+    {section.contents}
+    """
+
+    marks = client.chat.completions.create(
+        model='gpt-3.5-turbo',
+        response_model=CarMarkContainer,
+        messages=[{'role': 'user', 'content': prompt}],
     )
-    page = await browser.newPage()
-    await page.setViewport(viewport={'width': 1500, 'height': 1240})
-    await asyncio.sleep(1)
 
+    with open('car_marks.json', 'w') as f:
+        f.write(marks.model_dump_json())
+
+
+def fetch_search_pages_for_car_models():
+    client = instructor.from_openai(OpenAI())
+    with open('car_marks.json') as f:
+        marks = CarMarkContainer.model_validate_json(f.read())
+
+    for mark in marks.items:
+        log.info('fetching car models', mark=mark.mark)
+        resp = httpxc.get(EBAY_KLEINANZEIGE_URL + mark.href)
+        resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        for section in soup.select('section.browsebox-attribute'):
+            h2 = section.select_one('h2')
+            assert h2
+            if 'Marke' in h2.text:
+                break
+        else:
+            raise ValueError('Marke subsection not found')
+
+        prompt = f"""
+        Extract all the car models from the html:
+
+        {section.contents}
+        """
+
+        models = client.chat.completions.create(
+            model='gpt-3.5-turbo',
+            response_model=CarModelContainer,
+            messages=[{'role': 'user', 'content': prompt}],
+        )
+
+        log.info('fetched car models', mark=models.mark, models=models.car_models)
+
+        with open(
+            f'car_models_for_{models.mark.lower().replace(" ", "-")}.json', 'w'
+        ) as f:
+            f.write(models.model_dump_json())
+
+
+def load_car_models_search_pages() -> list[CarModel]:
+    models = []
+    for f in (DATA_DIR / 'car_models').glob('*.json'):
+        cms = CarModelContainer.model_validate_json(f.read_text())
+        models.extend(cms.car_models)
+    return models
+
+
+def fetch_search_pages_httpx(pages: Iterable[SearchPage]) -> None:
     for pq in pages:
         html_file_name = pq.file_prefix() + '.html'
         log.info('visiting', url=pq.url, file_name=html_file_name)
+        resp = httpxc.get(pq.url)
+        resp.raise_for_status()
+        page_content = resp.text
 
-        await page.goto(pq.url)
-        content = await page.content()
-        with open(DATA_DIR / 'html' / 'raw' / html_file_name, 'w') as f:
-            f.write(content)
+        with open(SEARCH_PAGES_HTML_RAW / html_file_name, 'w') as f:
+            f.write(page_content)
 
-        pagination_state = determine_pagination_state(content)
+        pagination_state = determine_pagination_state(page_content)
 
         log.info(
             'fetched page',
@@ -135,56 +204,95 @@ async def fetch_search_pages(pages: Iterable[SearchPage]) -> None:
             viewable_max_page_from_html=pagination_state.viewable_max_page,
         )
 
-        # We reached the max
         if pq.page >= pagination_state.viewable_max_page:
-            log.info("reached last page")
+            log.info('reached last page')
             break
 
-        await asyncio.sleep(1)
 
-    input("Press enter to close the browser")
+_BROWSER: Browser | None = None
+
+
+async def get_browser() -> Browser:
+    global _BROWSER
+    if _BROWSER is None:
+        _BROWSER = await launch(
+            executablePath='/etc/profiles/per-user/denis/bin/google-chrome-stable',
+            headless=False,
+        )
+    return _BROWSER
+
+
+async def fetch_search_pages_pyppeteer(pages: Iterable[SearchPage]) -> None:
+    browser = await get_browser()
+    page = await browser.newPage()
+    await page.setViewport(viewport={'width': 1500, 'height': 1240})
+    await asyncio.sleep(1)
+
+    for pq in pages:
+        while True:
+            html_file_name = pq.file_prefix() + '.html'
+            log.info('visiting', url=pq.url, file_name=html_file_name)
+
+            await page.goto(pq.url)
+            content = await page.content()
+            with open(SEARCH_PAGES_HTML_RAW / html_file_name, 'w') as f:
+                f.write(content)
+
+            pagination_state = determine_pagination_state(content)
+
+            log.info(
+                'fetched page',
+                url=pq.url,
+                page_from_iterator=pq.page,
+                page_from_html=pagination_state.current_page,
+                viewable_max_page_from_html=pagination_state.viewable_max_page,
+            )
+
+            if pq.page >= pagination_state.viewable_max_page:
+                log.info('reached last page')
+                break
+
+            pq.page += 1
+
+            await asyncio.sleep(1)
+
+    input('Press enter to close the browser')
     await browser.close()
 
 
 @dataclass
-class VisitableUrl:
-    url: str
-    file: Path
+class PaginationState:
+    # The highest page number that can be viewed in the bottom pagination menu
+    viewable_max_page: int
+
+    # Current page that can be extracted with CSS selectors
+    current_page: int
 
 
-async def visit_and_save_html(
-    browser: Browser, urls: list[VisitableUrl], sleep: float = 0
-) -> None:
-    page = await browser.newPage()
-    for url in tqdm(urls):
-        await page.goto(url.url)
-        content = await page.content()
-        with open(url.file, 'w') as f:
-            f.write(content)
+def determine_pagination_state(html: str) -> PaginationState:
+    soup = BeautifulSoup(html, 'html.parser')
+    # All the pages except the current one.
+    # The current has .pagination-current as a CSS class
+    non_current_pages = [int(int(div.text)) for div in soup.select('.pagination-page')]
 
-        await asyncio.sleep(sleep)
+    if len(non_current_pages) > 0:
+        viewable_max_page = max(non_current_pages)
+    else:
+        viewable_max_page = 1
+    (current_page,) = soup.select('.pagination-current')
+    return PaginationState(
+        viewable_max_page=viewable_max_page, current_page=int(current_page.text)
+    )
 
 
-def extract_car_infos_from_html(htmls: Iterable[Path]) -> None:
-    for p in htmls:
-        with open(p) as f:
-            soup = BeautifulSoup(f.read(), 'html.parser')
-            soup.prettify()
+async def fetch_search_pages():
+    car_models = load_car_models_search_pages()
+    search_pages = []
+    for car_model in car_models:
+        sp = CategorySearchPage.from_car_model(car_model)
+        search_pages.append(sp)
 
-        # remove javascript tags
-        script_tags = soup.find_all('script')
-        for script_tag in script_tags:
-            script_tag.decompose()
-
-        # with open(Path("./data/html/clean/") / p.name, 'w') as f:
-        #     f.write(soup.prettify())
-
-        cars = []
-        for car in soup.find_all('article'):
-            cars.append(extract_car_info_article(car))
-
-        for car in cars:
-            car.save()
+    await fetch_search_pages_pyppeteer(search_pages)
 
 
 class CarInfo(BaseModel):
@@ -250,11 +358,22 @@ def extract_car_info_article(soup: Any) -> CarInfo:
     return car_info
 
 
-def load_cars() -> Iterable[CarInfo]:
-    for file in CAR_INFO_DIR.glob("*"):
-        if file.is_dir():
-            continue
-        yield CarInfo.load(file)
+def extract_car_infos_from_html(htmls: Iterable[Path]) -> None:
+    htmls = list(htmls)
+    for p in tqdm(htmls):
+        with open(p) as f:
+            soup = BeautifulSoup(f.read(), 'html.parser')
+            soup.prettify()
+
+        # remove javascript tags
+        script_tags = soup.find_all('script')
+        for script_tag in script_tags:
+            script_tag.decompose()
+
+        cars = [extract_car_info_article(car) for car in soup.find_all('article')]
+
+        for car in cars:
+            car.save()
 
 
 def split_cars(cars: Iterable[CarInfo]) -> tuple[list[CarInfo], list[CarInfo]]:
@@ -270,15 +389,24 @@ def split_cars(cars: Iterable[CarInfo]) -> tuple[list[CarInfo], list[CarInfo]]:
     return fetched, not_fetched
 
 
-async def fetch_detailed_information_for_each_car():
-    browser = await launch(
-        executablePath="/etc/profiles/per-user/denis/bin/google-chrome-stable",
-        headless=False,
-    )
+def load_cars() -> Iterable[CarInfo]:
+    for file in CAR_INFO_DIR.glob('*'):
+        if file.is_dir():
+            continue
+        yield CarInfo.load(file)
+
+
+@dataclass
+class VisitableUrl:
+    url: str
+    file: Path
+
+
+async def fetch_detailed_information_for_each_car() -> None:
     cars = list(load_cars())
     fetched, not_fetched = split_cars(cars)
     log.info(
-        "loaded cars",
+        'loaded cars',
         total=len(cars),
         fetche=len(fetched),
         not_fetched=len(not_fetched),
@@ -292,7 +420,16 @@ async def fetch_detailed_information_for_each_car():
         for car in not_fetched
     ]
 
-    await visit_and_save_html(browser, urls, sleep=0.2)
+    await visit_and_save_html_httpx(urls, max_requests_per_second=30)
+
+
+def visit_and_save_html_httpx_sync(urls: list[VisitableUrl], sleep: float = 0) -> None:
+    for url in tqdm(urls):
+        resp = httpxc.get(url.url)
+        resp.raise_for_status()
+        with open(url.file, 'w') as f:
+            f.write(resp.text)
+        time.sleep(sleep)
 
 
 def clean_detailed_information(car: CarInfo) -> None:
@@ -303,7 +440,7 @@ def clean_detailed_information(car: CarInfo) -> None:
     for script_tag in script_tags:
         script_tag.decompose()
 
-    gdpr_banner = soup.find_all("div", id="gdpr-banner-container")
+    gdpr_banner = soup.find_all('div', id='gdpr-banner-container')
     for banner in gdpr_banner:
         banner.decompose()
 
@@ -311,30 +448,61 @@ def clean_detailed_information(car: CarInfo) -> None:
         f.write(soup.prettify())
 
 
-def clean_detailed_information_for_each_car():
-    cars = list(load_cars())
-
-    for car in tqdm(cars):
+def clean_detailed_information_car(car):
+    if car.car_details_html_file_raw.exists():
         clean_detailed_information(car)
 
 
+def clean_detailed_information_for_each_car():
+    cars = list(load_cars())
+
+    # Input are available
+    cars = [c for c in cars if c.car_details_html_file_raw.exists()]
+
+    # Output hasn't yet been processed
+    cars = [c for c in cars if not c.car_details_html_file_clean.exists()]
+
+    # Suggest using Pool's context manager for better resource management
+    with Pool(processes=cpu_count()) as pool:
+        # Use tqdm.starmap to display progress bar for parallel processing
+        list(tqdm(pool.imap(clean_detailed_information_car, cars), total=len(cars)))
+
+
+# def clean_detailed_information_for_each_car():
+#     cars = list(load_cars())
+#     cars = [c for c in cars if c.car_details_html_file_raw.exists()]
+#
+#     for car in tqdm(cars):
+#         clean_detailed_information(car)
+
+
 class AdDetailsList(BaseModel):
-    marke: str = ""
-    modell: str = ""
-    kilometerstand: str = ""
-    fahrzeugzustand: str = ""
-    erstzulassung: str = ""
-    kraftstoffart: str = ""
-    leistung: str = ""
-    getriebe: str = ""
-    fahrzeugtyp: str = ""
-    anzahl_tueren: str = ""
-    hu_bis: str = ""
-    umweltplakette: str = ""
-    schadstoffklasse: str = ""
-    aussenfarbe: str = ""
-    material_innenausstattung: str = ""
-    art: str = ""
+    marke: str = ''
+    modell: str = ''
+    kilometerstand: str = ''
+    fahrzeugzustand: str = ''
+    erstzulassung: str = ''
+    kraftstoffart: str = ''
+    leistung: str = ''
+    getriebe: str = ''
+    fahrzeugtyp: str = ''
+    anzahl_tueren: str = ''
+    hu_bis: str = ''
+    umweltplakette: str = ''
+    schadstoffklasse: str = ''
+    aussenfarbe: str = ''
+    material_innenausstattung: str = ''
+    art: str = ''
+
+
+@dataclass
+class CarParsedInfo:
+    km: int
+    horsepower: int
+    year: int
+    title_parsed: str
+    plz: int
+    # price_parsed: float
 
 
 class AdMainInfo(BaseModel):
@@ -348,7 +516,18 @@ class CarDetailPage(BaseModel):
     ad_main_info: AdMainInfo
 
 
-def extract_detailed_information(car: CarInfo) -> CarDetailPage | None:
+class CarDetailPageWithParsedInfo(BaseModel):
+    url: str
+    ad_details_list: AdDetailsList
+    ad_main_info: AdMainInfo
+    parsed_info: CarParsedInfo
+
+
+def remove_line_breaks(s: str) -> str:
+    return ' '.join(s.split())
+
+
+def extract_detailed_information(car: CarInfo) -> CarDetailPage:
     keys_mapping = {
         'Marke': 'marke',
         'Modell': 'modell',
@@ -371,9 +550,9 @@ def extract_detailed_information(car: CarInfo) -> CarDetailPage | None:
     with open(car.car_details_html_file_clean) as f:
         soup = BeautifulSoup(f.read(), 'html.parser')
 
-    title = remove_line_breaks(soup.select_one("#viewad-title").text.strip())
-    price = soup.select_one("#viewad-price").text.strip()
-    locality = soup.select_one("#viewad-locality").text.strip()
+    title = remove_line_breaks(soup.select_one('#viewad-title').text.strip())
+    price = soup.select_one('#viewad-price').text.strip()
+    locality = soup.select_one('#viewad-locality').text.strip()
 
     ad_main_info = AdMainInfo(
         title=title,
@@ -381,7 +560,7 @@ def extract_detailed_information(car: CarInfo) -> CarDetailPage | None:
         locality=locality,
     )
 
-    (details,) = soup.find_all('div', id="viewad-details")
+    (details,) = soup.find_all('div', id='viewad-details')
     details_dict = {}
     for detail in details.select('.addetailslist--detail'):
         key = detail.contents[0].text.strip()
@@ -389,7 +568,7 @@ def extract_detailed_information(car: CarInfo) -> CarDetailPage | None:
         if key in keys_mapping:
             details_dict[keys_mapping[key]] = value
         else:
-            log.warning("unhandled car detail key", key=key, value=value)
+            log.warning('unhandled car detail key', key=key, value=value)
 
     ad_details_list = AdDetailsList.model_validate(details_dict)
     return CarDetailPage(
@@ -398,44 +577,111 @@ def extract_detailed_information(car: CarInfo) -> CarDetailPage | None:
     )
 
 
+def parse_car_details(car: CarInfo):
+    try:
+        detail = extract_detailed_information(car)
+    except Exception as e:
+        log.warning(
+            'extract_detailed_information',
+            exception=str(e),
+            file=car.car_details_html_file_clean,
+        )
+        return
+
+    if detail.ad_details_list.art.strip() != '':
+        return
+    if detail.ad_details_list.kilometerstand == '':
+        return
+
+    try:
+        return CarDetailPageWithParsedInfo(
+            url=car.details_url,
+            ad_details_list=detail.ad_details_list,
+            ad_main_info=detail.ad_main_info,
+            parsed_info=parse_car_info(detail.ad_main_info, detail.ad_details_list),
+        )
+    except Exception as e:
+        log.warning('parsing car details failed', exception=str(e))
+
+
 def extract_detailed_information_for_each_car():
     cars = list(load_cars())
 
-    details = []
+    cars = [c for c in cars if c.car_details_html_file_clean.exists()]
+
+    parsed_details: list[CarDetailPageWithParsedInfo] = []
     for car in tqdm(cars):
-        try:
-            detail = extract_detailed_information(car)
-            details.append(detail)
-        except Exception as e:
-            log.exception(
-                "extract_detailed_information",
-                exception=e,
-                file=car.car_details_html_file_clean,
-            )
-    save_to_csv([flatten_car_detail_page(d) for d in details], DATA_DIR / 'output.csv')
+        parsed = parse_car_details(car)
+        if parsed:
+            parsed_details.append(parsed)
+
+    save_to_csv(
+        [flatten_car_detail_page(d) for d in parsed_details], DATA_DIR / 'output.csv'
+    )
 
 
-def flatten_car_detail_page(car_detail_page: CarDetailPage) -> dict[str, Any]:
+def remove_non_numbers(s: str) -> str:
+    return ''.join(char for char in s if char.isdigit())
+
+
+def parse_car_info(
+    ad_main_info: AdMainInfo, ad_details_list: AdDetailsList
+) -> CarParsedInfo:
+    """
+    kilometerstand -> int: remove letters, remove dot, coerce int
+    leistung -> int: remove letters, coerce int
+    erstzulassung -> year -> extract numbers from string, coerce int
+    title -> remove "Reserviert • Gelöscht • "
+    plz -> first five numbers from locality
+    city -> ...
+    """
+    km = int(remove_non_numbers(ad_details_list.kilometerstand))
+
+    if ad_details_list.leistung == '':
+        horsepower = 0
+    else:
+        horsepower = int(remove_non_numbers(ad_details_list.leistung))
+
+    year = int(remove_non_numbers(ad_details_list.erstzulassung))
+    title = ad_main_info.title.replace('Reserviert • Gelöscht • ', '')
+    plz = int(ad_main_info.locality.strip()[:5])
+
+    return CarParsedInfo(
+        km=km,
+        horsepower=horsepower,
+        year=year,
+        title_parsed=title,
+        plz=plz,
+    )
+
+
+def flatten_car_detail_page(parsed: CarDetailPageWithParsedInfo) -> dict[str, Any]:
     return {
-        'marke': car_detail_page.ad_details_list.marke,
-        'modell': car_detail_page.ad_details_list.modell,
-        'kilometerstand': car_detail_page.ad_details_list.kilometerstand,
-        'fahrzeugzustand': car_detail_page.ad_details_list.fahrzeugzustand,
-        'erstzulassung': car_detail_page.ad_details_list.erstzulassung,
-        'kraftstoffart': car_detail_page.ad_details_list.kraftstoffart,
-        'leistung': car_detail_page.ad_details_list.leistung,
-        'getriebe': car_detail_page.ad_details_list.getriebe,
-        'fahrzeugtyp': car_detail_page.ad_details_list.fahrzeugtyp,
-        'anzahl_tueren': car_detail_page.ad_details_list.anzahl_tueren,
-        'hu_bis': car_detail_page.ad_details_list.hu_bis,
-        'umweltplakette': car_detail_page.ad_details_list.umweltplakette,
-        'schadstoffklasse': car_detail_page.ad_details_list.schadstoffklasse,
-        'aussenfarbe': car_detail_page.ad_details_list.aussenfarbe,
-        'material_innenausstattung': car_detail_page.ad_details_list.material_innenausstattung,
-        'art': car_detail_page.ad_details_list.art,
-        'price': car_detail_page.ad_main_info.price,
-        'title': car_detail_page.ad_main_info.title,
-        'locality': car_detail_page.ad_main_info.locality,
+        'marke': parsed.ad_details_list.marke,
+        'modell': parsed.ad_details_list.modell,
+        'km': parsed.parsed_info.km,
+        'horsepower': parsed.parsed_info.horsepower,
+        'year': parsed.parsed_info.year,
+        'title_parsed': parsed.parsed_info.title_parsed,
+        'plz': parsed.parsed_info.plz,
+        'url': parsed.url,
+        'kilometerstand': parsed.ad_details_list.kilometerstand,
+        'fahrzeugzustand': parsed.ad_details_list.fahrzeugzustand,
+        'erstzulassung': parsed.ad_details_list.erstzulassung,
+        'kraftstoffart': parsed.ad_details_list.kraftstoffart,
+        'leistung': parsed.ad_details_list.leistung,
+        'getriebe': parsed.ad_details_list.getriebe,
+        'fahrzeugtyp': parsed.ad_details_list.fahrzeugtyp,
+        'anzahl_tueren': parsed.ad_details_list.anzahl_tueren,
+        'hu_bis': parsed.ad_details_list.hu_bis,
+        'umweltplakette': parsed.ad_details_list.umweltplakette,
+        'schadstoffklasse': parsed.ad_details_list.schadstoffklasse,
+        'aussenfarbe': parsed.ad_details_list.aussenfarbe,
+        'material_innenausstattung': parsed.ad_details_list.material_innenausstattung,
+        'art': parsed.ad_details_list.art,
+        'price': parsed.ad_main_info.price,
+        'title': parsed.ad_main_info.title,
+        'locality': parsed.ad_main_info.locality,
     }
 
 
@@ -450,49 +696,57 @@ def save_to_csv(l: list[dict[str, Any]], file: Path) -> None:
         writer.writerows(l)
 
 
-def remove_line_breaks(s: str) -> str:
-    return ' '.join(s.split())
+async def fetch_save(url: VisitableUrl, semaphore: asyncio.Semaphore):
+    # Acquire the semaphore before making the HTTP request
+    async with semaphore:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            try:
+                resp = await client.get(url.url)
+                resp.raise_for_status()
+                with open(url.file, 'w') as f:
+                    f.write(resp.text)
+            except Exception as e:
+                log.warning('an exception ocurred', e=str(e))
 
 
-@dataclass
-class PaginationState:
-    # The highest page number that can be viewed in the bottom pagination menu
-    viewable_max_page: int
+async def visit_and_save_html_httpx(
+    urls: list[VisitableUrl], max_requests_per_second: int
+) -> None:
+    # Create a semaphore with a limit on concurrent requests
+    semaphore = asyncio.Semaphore(max_requests_per_second)
 
-    # Current page that can be extracted with CSS selectors
-    current_page: int
+    # Setting a pause interval to avoid exceeding the rate limit
+    interval = 1 / max_requests_per_second
+
+    async def throttled_fetch_save(
+        url: VisitableUrl, semaphore: asyncio.Semaphore, interval: float
+    ):
+        await fetch_save(url, semaphore)
+        await asyncio.sleep(interval)
+
+    tasks = [throttled_fetch_save(url, semaphore, interval) for url in urls]
+    for f in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
+        await f
 
 
-def determine_pagination_state(html: str) -> PaginationState:
-    soup = BeautifulSoup(html, 'html.parser')
-    viewable_max_page = max(
-        int(int(div.text)) for div in soup.select(".pagination-page")
-    )
-    (current_page,) = soup.select(".pagination-current")
-    return PaginationState(
-        viewable_max_page=viewable_max_page, current_page=int(current_page.text)
-    )
+def main():
+    asyncio.get_event_loop()
 
+    # Get page
+    # 1. Crawl search pages
+    # event_loop.run_until_complete(fetch_search_pages())
 
-if __name__ == "__main__":
-    # 1. Fetch data fro
-    # it = iterate_category_search_page(
-    #     base_url=EBAY_KLEINANZEIGE_URL,
-    #     before_page='s-auto',
-    #     after_page='c216+autos.typ_s:bus',
-    # )
-    # asyncio.get_event_loop().run_until_complete(fetch_search_pages(it))
-
-    # 2.From each page extract the summary of the car
-    # extract_car_infos_from_html(Path("./data/html/raw/").glob("*"))
+    # Extract cars info from search page HTML
+    # extract_car_infos_from_html(SEARCH_PAGES_HTML_RAW.glob("*"))
 
     # 3. Extract information from each car
-    # asyncio.get_event_loop().run_until_complete(
-    #     fetch_detailed_information_for_each_car()
-    # )
+    # event_loop.run_until_complete(fetch_detailed_information_for_each_car())
 
-    # 4. Clean html for car details
-    clean_detailed_information_for_each_car()
-
-    # 5. Extract deatils
+    # 4. Clean detailed information
+    # clean_detailed_information_for_each_car()
+    # 5. Extract
     extract_detailed_information_for_each_car()
+
+
+if __name__ == '__main__':
+    main()

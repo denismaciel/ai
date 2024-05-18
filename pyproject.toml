@@ -9,10 +9,13 @@ description = "Denis' AI Stuff"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "beautifulsoup4",
+    "httpx",
+    "instructor",
+    "openai",
     "pydantic",
     "pyppeteer",
     "structlog",
-    "beautifulsoup4",
     "tqdm",
 ]
 

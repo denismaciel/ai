@@ -1,0 +1,71 @@
+line-length = 88
+
+# Documentation of each set of rules:
+lint.select = [
+  "E", # pycodestyle errors
+  "W", # pycodestyle errors
+  "F", # pyflakes
+  "ISC", #flake8-implicit-str-concat,
+  "NPY", # numpy
+  "B", # bugbear
+  "PD", # pandas-vet
+  "PERF", # perflint
+  "UP", # pyupgrade
+  "PGH", # pygrep-hooks
+  "RUF", # ruff-specific rules
+
+]
+lint.ignore = [
+  "E501", # E501 Line too long
+  "E712", # Comparison to `False` should be `cond is not False` or `if cond
+  "E741", # Ambiguous variable name
+  "E721", # Do not compare types, use `isinstance()`
+  "PD901", #  Avoid using the generic variable name `df` for DataFrames
+  "PD015", # Use `.merge` method instead of `pd.merge` function. They have equivalent functionality
+  "PD101", # Using `series.nunique()` for checking that a series is constant is inefficient
+]
+
+# Allow autofix for all enabled rules (when `--fix`) is provided.
+lint.fixable = ["A", "B", "C", "D", "E", "F", "G", "I", "N", "Q", "S", "T", "W", "ANN", "ARG", "BLE", "COM", "DJ", "DTZ", "EM", "ERA", "EXE", "FBT", "ICN", "INP", "ISC", "NPY", "PD", "PGH", "PIE", "PL", "PT", "PTH", "PYI", "RET", "RSE", "RUF", "SIM", "SLF", "TCH", "TID", "TRY", "UP", "YTT"]
+lint.unfixable = []
+
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "venv",
+]
+
+# Allow unused variables when underscore-prefixed.
+# dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+target-version = "py312"
+
+[lint.mccabe]
+# Unlike Flake8, default to a complexity level of 10.
+max-complexity = 10
+
+[format]
+quote-style = "single"
+indent-style = "space"
+docstring-code-format = true
+
+
