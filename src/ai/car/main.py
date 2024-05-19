@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import csv
-import hashlib
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -20,13 +18,17 @@ from openai import OpenAI
 from pydantic import BaseModel
 from pyppeteer import launch
 from pyppeteer.browser import Browser
-from tqdm import tqdm
-# from tqdm.asyncio import tqdm
+from tqdm.asyncio import tqdm
 
-EBAY_KLEINANZEIGE_URL = 'https://www.kleinanzeigen.de/'
-DATA_DIR = Path('data')
-CAR_INFO_DIR = DATA_DIR / 'car_info'
-SEARCH_PAGES_HTML_RAW = DATA_DIR / 'search_pages' / 'raw'
+from ai.car.models import CarInfo
+from ai.car.models import EBAY_KLEINANZEIGE_URL
+from ai.car.models import CarInfo
+
+from ai.car.models import DATA_DIR
+from ai.car.models import SEARCH_PAGES_HTML_RAW
+from ai.car.utils import load_cars
+
+from ai.car.parse_car_details import extract_detailed_information_for_each_car_parallel
 
 configure_logging()
 log = get_logger()
@@ -88,7 +90,7 @@ class CategorySearchPage(BaseModel):
 
     def file_prefix(self) -> str:
         return (
-            f'{self.before_page.replace('/', '__')}__{self.after_page}__{self.page:03d}'
+            f'{self.before_page.replace("/", "__")}__{self.after_page}__{self.page:03d}'
         )
 
     @classmethod
@@ -295,42 +297,6 @@ async def fetch_search_pages():
     await fetch_search_pages_pyppeteer(search_pages)
 
 
-class CarInfo(BaseModel):
-    title: str
-    location: str
-    description: str
-    price: str
-    mileage: str | None
-    year: str | None
-    details_link: str
-
-    @property
-    def uid(self) -> str:
-        hash_object = hashlib.sha256(self.details_link.encode())
-        return hash_object.hexdigest()
-
-    def save(self) -> None:
-        file_name = self.uid + '.json'
-        with open(CAR_INFO_DIR / file_name, 'w') as f:
-            f.write(self.model_dump_json())
-
-    @classmethod
-    def load(cls, file: Path) -> CarInfo:
-        return cls.model_validate_json(file.read_text())
-
-    @property
-    def details_url(self) -> str:
-        return EBAY_KLEINANZEIGE_URL + f'/{self.details_link}'
-
-    @property
-    def car_details_html_file_raw(self) -> Path:
-        return DATA_DIR / 'car_detail' / 'html' / 'raw' / (self.uid + '.html')
-
-    @property
-    def car_details_html_file_clean(self) -> Path:
-        return DATA_DIR / 'car_detail' / 'html' / 'clean' / (self.uid + '.html')
-
-
 def extract_car_info_article(soup: Any) -> CarInfo:
     title = soup.find('a', class_='ellipsis').text.strip()
     location = soup.find('div', class_='aditem-main--top--left').text.strip()
@@ -387,13 +353,6 @@ def split_cars(cars: Iterable[CarInfo]) -> tuple[list[CarInfo], list[CarInfo]]:
             not_fetched.append(car)
 
     return fetched, not_fetched
-
-
-def load_cars() -> Iterable[CarInfo]:
-    for file in CAR_INFO_DIR.glob('*'):
-        if file.is_dir():
-            continue
-        yield CarInfo.load(file)
 
 
 @dataclass
@@ -476,226 +435,6 @@ def clean_detailed_information_for_each_car():
 #         clean_detailed_information(car)
 
 
-class AdDetailsList(BaseModel):
-    marke: str = ''
-    modell: str = ''
-    kilometerstand: str = ''
-    fahrzeugzustand: str = ''
-    erstzulassung: str = ''
-    kraftstoffart: str = ''
-    leistung: str = ''
-    getriebe: str = ''
-    fahrzeugtyp: str = ''
-    anzahl_tueren: str = ''
-    hu_bis: str = ''
-    umweltplakette: str = ''
-    schadstoffklasse: str = ''
-    aussenfarbe: str = ''
-    material_innenausstattung: str = ''
-    art: str = ''
-
-
-@dataclass
-class CarParsedInfo:
-    km: int
-    horsepower: int
-    year: int
-    title_parsed: str
-    plz: int
-    # price_parsed: float
-
-
-class AdMainInfo(BaseModel):
-    price: str
-    title: str
-    locality: str
-
-
-class CarDetailPage(BaseModel):
-    ad_details_list: AdDetailsList
-    ad_main_info: AdMainInfo
-
-
-class CarDetailPageWithParsedInfo(BaseModel):
-    url: str
-    ad_details_list: AdDetailsList
-    ad_main_info: AdMainInfo
-    parsed_info: CarParsedInfo
-
-
-def remove_line_breaks(s: str) -> str:
-    return ' '.join(s.split())
-
-
-def extract_detailed_information(car: CarInfo) -> CarDetailPage:
-    keys_mapping = {
-        'Marke': 'marke',
-        'Modell': 'modell',
-        'Kilometerstand': 'kilometerstand',
-        'Fahrzeugzustand': 'fahrzeugzustand',
-        'Erstzulassung': 'erstzulassung',
-        'Kraftstoffart': 'kraftstoffart',
-        'Leistung': 'leistung',
-        'Getriebe': 'getriebe',
-        'Fahrzeugtyp': 'fahrzeugtyp',
-        'Anzahl Türen': 'anzahl_tueren',
-        'HU bis': 'hu_bis',
-        'Umweltplakette': 'umweltplakette',
-        'Schadstoffklasse': 'schadstoffklasse',
-        'Außenfarbe': 'aussenfarbe',
-        'Material Innenausstattung': 'material_innenausstattung',
-        'Art': 'art',
-    }
-
-    with open(car.car_details_html_file_clean) as f:
-        soup = BeautifulSoup(f.read(), 'html.parser')
-
-    title = remove_line_breaks(soup.select_one('#viewad-title').text.strip())
-    price = soup.select_one('#viewad-price').text.strip()
-    locality = soup.select_one('#viewad-locality').text.strip()
-
-    ad_main_info = AdMainInfo(
-        title=title,
-        price=price,
-        locality=locality,
-    )
-
-    (details,) = soup.find_all('div', id='viewad-details')
-    details_dict = {}
-    for detail in details.select('.addetailslist--detail'):
-        key = detail.contents[0].text.strip()
-        value = detail.select_one('.addetailslist--detail--value').text.strip()
-        if key in keys_mapping:
-            details_dict[keys_mapping[key]] = value
-        else:
-            log.warning('unhandled car detail key', key=key, value=value)
-
-    ad_details_list = AdDetailsList.model_validate(details_dict)
-    return CarDetailPage(
-        ad_main_info=ad_main_info,
-        ad_details_list=ad_details_list,
-    )
-
-
-def parse_car_details(car: CarInfo):
-    try:
-        detail = extract_detailed_information(car)
-    except Exception as e:
-        log.warning(
-            'extract_detailed_information',
-            exception=str(e),
-            file=car.car_details_html_file_clean,
-        )
-        return
-
-    if detail.ad_details_list.art.strip() != '':
-        return
-    if detail.ad_details_list.kilometerstand == '':
-        return
-
-    try:
-        return CarDetailPageWithParsedInfo(
-            url=car.details_url,
-            ad_details_list=detail.ad_details_list,
-            ad_main_info=detail.ad_main_info,
-            parsed_info=parse_car_info(detail.ad_main_info, detail.ad_details_list),
-        )
-    except Exception as e:
-        log.warning('parsing car details failed', exception=str(e))
-
-
-def extract_detailed_information_for_each_car():
-    cars = list(load_cars())
-
-    cars = [c for c in cars if c.car_details_html_file_clean.exists()]
-
-    parsed_details: list[CarDetailPageWithParsedInfo] = []
-    for car in tqdm(cars):
-        parsed = parse_car_details(car)
-        if parsed:
-            parsed_details.append(parsed)
-
-    save_to_csv(
-        [flatten_car_detail_page(d) for d in parsed_details], DATA_DIR / 'output.csv'
-    )
-
-
-def remove_non_numbers(s: str) -> str:
-    return ''.join(char for char in s if char.isdigit())
-
-
-def parse_car_info(
-    ad_main_info: AdMainInfo, ad_details_list: AdDetailsList
-) -> CarParsedInfo:
-    """
-    kilometerstand -> int: remove letters, remove dot, coerce int
-    leistung -> int: remove letters, coerce int
-    erstzulassung -> year -> extract numbers from string, coerce int
-    title -> remove "Reserviert • Gelöscht • "
-    plz -> first five numbers from locality
-    city -> ...
-    """
-    km = int(remove_non_numbers(ad_details_list.kilometerstand))
-
-    if ad_details_list.leistung == '':
-        horsepower = 0
-    else:
-        horsepower = int(remove_non_numbers(ad_details_list.leistung))
-
-    year = int(remove_non_numbers(ad_details_list.erstzulassung))
-    title = ad_main_info.title.replace('Reserviert • Gelöscht • ', '')
-    plz = int(ad_main_info.locality.strip()[:5])
-
-    return CarParsedInfo(
-        km=km,
-        horsepower=horsepower,
-        year=year,
-        title_parsed=title,
-        plz=plz,
-    )
-
-
-def flatten_car_detail_page(parsed: CarDetailPageWithParsedInfo) -> dict[str, Any]:
-    return {
-        'marke': parsed.ad_details_list.marke,
-        'modell': parsed.ad_details_list.modell,
-        'km': parsed.parsed_info.km,
-        'horsepower': parsed.parsed_info.horsepower,
-        'year': parsed.parsed_info.year,
-        'title_parsed': parsed.parsed_info.title_parsed,
-        'plz': parsed.parsed_info.plz,
-        'url': parsed.url,
-        'kilometerstand': parsed.ad_details_list.kilometerstand,
-        'fahrzeugzustand': parsed.ad_details_list.fahrzeugzustand,
-        'erstzulassung': parsed.ad_details_list.erstzulassung,
-        'kraftstoffart': parsed.ad_details_list.kraftstoffart,
-        'leistung': parsed.ad_details_list.leistung,
-        'getriebe': parsed.ad_details_list.getriebe,
-        'fahrzeugtyp': parsed.ad_details_list.fahrzeugtyp,
-        'anzahl_tueren': parsed.ad_details_list.anzahl_tueren,
-        'hu_bis': parsed.ad_details_list.hu_bis,
-        'umweltplakette': parsed.ad_details_list.umweltplakette,
-        'schadstoffklasse': parsed.ad_details_list.schadstoffklasse,
-        'aussenfarbe': parsed.ad_details_list.aussenfarbe,
-        'material_innenausstattung': parsed.ad_details_list.material_innenausstattung,
-        'art': parsed.ad_details_list.art,
-        'price': parsed.ad_main_info.price,
-        'title': parsed.ad_main_info.title,
-        'locality': parsed.ad_main_info.locality,
-    }
-
-
-def save_to_csv(l: list[dict[str, Any]], file: Path) -> None:
-    if len(l) == 0:
-        log.warning('list is empty')
-
-    columns = l[0].keys()
-    with open(file, 'w', newline='') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=columns)
-        writer.writeheader()
-        writer.writerows(l)
-
-
 async def fetch_save(url: VisitableUrl, semaphore: asyncio.Semaphore):
     # Acquire the semaphore before making the HTTP request
     async with semaphore:
@@ -745,7 +484,7 @@ def main():
     # 4. Clean detailed information
     # clean_detailed_information_for_each_car()
     # 5. Extract
-    extract_detailed_information_for_each_car()
+    extract_detailed_information_for_each_car_parallel()
 
 
 if __name__ == '__main__':

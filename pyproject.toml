@@ -15,12 +15,14 @@ dependencies = [
     "openai",
     "pydantic",
     "pyppeteer",
+    "pyarrow",
+    "streamlit",
     "structlog",
     "tqdm",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "mypy", "ipython", "ipdb"]
+dev = ["pytest", "mypy", "ipython", "ipdb", "pandas", "jupyterlab"]
 test = ["coverage"]
 
 [project.scripts]

@@ -42,6 +42,7 @@ repos:
   #   rev: v4.0.0-alpha.8
   #   hooks:
   #     - id: prettier
+  #--ignore-path=recap-app/.prettierignore]
   - repo: https://github.com/Yelp/detect-secrets
     rev: v1.5.0
     hooks:
